@@ -48,30 +48,6 @@ except Exception as e:
     logger.error(f"Redis connection failed: {e}")
     exit(1)
 
-# Local cache to store pre-cached data
-local_cache = {}
-
-def load_precache_to_local():
-    """Tải tất cả dữ liệu pre-cached từ Redis vào local_cache một lần."""
-    try:
-        # Lấy tất cả các khóa trong PRECACHE_KEY_SET
-        cache_keys = redis_client.smembers(PRECACHE_KEY_SET)
-        if not cache_keys:
-            logger.info("No pre-cached keys found in Redis")
-            return
-
-        # Tải dữ liệu cho từng khóa
-        for key in cache_keys:
-            try:
-                data = redis_client.get(key)
-                if data:
-                    local_cache[key] = data
-            except Exception as e:
-                logger.error(f"Failed to load key {key}: {e}")
-        logger.info(f"Loaded {len(local_cache)} pre-cached items into local memory")
-    except Exception as e:
-        logger.error(f"Failed to load pre-cache: {e}")
-
 def validate_movie_data(movie: Dict[str, Any]) -> bool:
     return bool(
         movie.get("_id") and movie.get("name") and movie.get("slug") and movie.get("content") and
@@ -95,11 +71,11 @@ def sanitize_string(s: Any) -> str:
     s = s.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
     return "".join(c for c in s if c.isprintable())
 
-def cache_movie(movie: Dict[str, Any]) -> bool:
+def cache_movie(movie: Dict[str, Any]) -> tuple[bool, bool]:
     slug = movie.get("slug", "")
     movie_id = movie.get("_id", "")
     if not slug or not movie_id:
-        return False
+        return False, False
 
     cache_key = f"movieapp:movie_{slug}"
     id_to_slug_key = f"movieapp:id_to_slug_{movie_id}"
@@ -110,15 +86,15 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
         data = response.json()
         time.sleep(2.0)
     except requests.RequestException:
-        return False
+        return False, False
 
     if not data.get("status", False):
-        return False
+        return False, False
 
     movie_data = data.get("movie", {})
     episodes_data = data.get("episodes", [])
     if not validate_movie_data(movie_data):
-        return False
+        return False, False
 
     for key in ["content", "name", "origin_name", "trailer_url", "filename"]:
         if key in movie_data:
@@ -139,27 +115,22 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
     }
     full_data_json = json.dumps(full_data, ensure_ascii=False)
 
-    # So sánh với dữ liệu trong local_cache thay vì truy vấn Redis
-    existing_data = local_cache.get(cache_key, "{}")
-    if existing_data and existing_data != "{}":
-        if compare_json(full_data_json, existing_data):
-            logger.info(f"Skipped unchanged: {slug}")
-            return True
-
-    # Cập nhật Redis và local_cache nếu dữ liệu mới
     try:
+        existing_data = redis_client.get(cache_key) or "{}"
+        if existing_data and existing_data != "{}":
+            if compare_json(full_data_json, existing_data):
+                logger.info(f"Skipped unchanged: {slug}")
+                return True, True  # Indicate skip condition
         redis_client.set(cache_key, full_data_json)
         redis_client.sadd(PRECACHE_KEY_SET, cache_key)
-        local_cache[cache_key] = full_data_json  # Cập nhật local_cache
         logger.info(f"Cached movie: {slug}")
     except Exception:
-        return False
+        return False, False
 
     try:
         redis_client.set(id_to_slug_key, slug)
-        local_cache[id_to_slug_key] = slug  # Cập nhật local_cache
     except Exception:
-        return False
+        return False, False
 
     for server_index, server in enumerate(episodes_data[-MAX_EPISODES:]):
         for episode_index, episode in enumerate(server.get("server_data", [])):
@@ -176,54 +147,69 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
             }
             stream_data_json = json.dumps(stream_data, ensure_ascii=False)
 
-            # So sánh với dữ liệu trong local_cache
-            existing_stream = local_cache.get(stream_key, "{}")
-            if existing_stream and existing_stream != "{}":
-                if compare_json(stream_data_json, existing_stream):
-                    continue
-
-            # Cập nhật Redis và local_cache
             try:
+                existing_stream = redis_client.get(stream_key) or "{}"
+                if existing_stream and existing_stream != "{}":
+                    if compare_json(stream_data_json, existing_stream):
+                        continue
                 redis_client.set(stream_key, stream_data_json)
                 redis_client.sadd(PRECACHE_KEY_SET, stream_key)
-                local_cache[stream_key] = stream_data_json  # Cập nhật local_cache
             except Exception:
                 continue
 
     logger.info(f"Updated episodes for: {slug}")
-    return True
+    return True, False
 
 def crawl_movies():
-    page = 1
     logger.info(f"Start crawl at {datetime.utcnow().isoformat()}Z")
 
-    # Tải pre-cache một lần trước khi bắt đầu crawl
-    load_precache_to_local()
+    # Fetch the first page to get totalPages
+    try:
+        response = requests.get(f"{API_URL}?page=1&limit={LIMIT}", headers={"User-Agent": USER_AGENT}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException:
+        logger.error("Failed to fetch initial page")
+        return
 
-    while True:
+    if not data.get("status", False):
+        logger.error("Initial page fetch returned invalid status")
+        return
+
+    total_pages = data.get("pagination", {}).get("totalPages", 0)
+    if total_pages == 0:
+        logger.error("No pages available")
+        return
+
+    # Start from the highest page and work backward
+    for page in range(total_pages, 0, -1):
         try:
             response = requests.get(f"{API_URL}?page={page}&limit={LIMIT}", headers={"User-Agent": USER_AGENT}, timeout=10)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException:
-            break
+            logger.error(f"Failed to fetch page {page}")
+            continue
 
         if not data.get("status", False):
-            break
+            logger.error(f"Page {page} returned invalid status")
+            continue
 
         items = data.get("items", [])
-        total_pages = data.get("pagination", {}).get("totalPages", 0)
-
         if not items:
-            break
+            logger.info(f"No items found on page {page}")
+            continue
 
         for item in items:
-            cache_movie(item)
+            success, should_stop = cache_movie(item)
+            if should_stop:
+                logger.info(f"Stopping crawl due to unchanged movie: {item.get('slug', 'unknown')}")
+                return
+            if not success:
+                logger.warning(f"Failed to cache movie: {item.get('slug', 'unknown')}")
 
-        if page >= total_pages:
-            break
-
-        page += 1
+        logger.info(f"Processed page {page}")
+        time.sleep(1.0)
 
     logger.info(f"Crawl done at {datetime.utcnow().isoformat()}Z")
 
