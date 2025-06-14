@@ -71,11 +71,11 @@ def sanitize_string(s: Any) -> str:
     s = s.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
     return "".join(c for c in s if c.isprintable())
 
-def cache_movie(movie: Dict[str, Any]) -> tuple[bool, bool]:
+def cache_movie(movie: Dict[str, Any]) -> bool:
     slug = movie.get("slug", "")
     movie_id = movie.get("_id", "")
     if not slug or not movie_id:
-        return False, False
+        return False
 
     cache_key = f"movieapp:movie_{slug}"
     id_to_slug_key = f"movieapp:id_to_slug_{movie_id}"
@@ -86,15 +86,15 @@ def cache_movie(movie: Dict[str, Any]) -> tuple[bool, bool]:
         data = response.json()
         time.sleep(2.0)
     except requests.RequestException:
-        return False, False
+        return False
 
     if not data.get("status", False):
-        return False, False
+        return False
 
     movie_data = data.get("movie", {})
     episodes_data = data.get("episodes", [])
     if not validate_movie_data(movie_data):
-        return False, False
+        return False
 
     for key in ["content", "name", "origin_name", "trailer_url", "filename"]:
         if key in movie_data:
@@ -120,17 +120,17 @@ def cache_movie(movie: Dict[str, Any]) -> tuple[bool, bool]:
         if existing_data and existing_data != "{}":
             if compare_json(full_data_json, existing_data):
                 logger.info(f"Skipped unchanged: {slug}")
-                return True, True  # Indicate skip condition
+                return True
         redis_client.set(cache_key, full_data_json)
         redis_client.sadd(PRECACHE_KEY_SET, cache_key)
         logger.info(f"Cached movie: {slug}")
     except Exception:
-        return False, False
+        return False
 
     try:
         redis_client.set(id_to_slug_key, slug)
     except Exception:
-        return False, False
+        return False
 
     for server_index, server in enumerate(episodes_data[-MAX_EPISODES:]):
         for episode_index, episode in enumerate(server.get("server_data", [])):
@@ -158,7 +158,7 @@ def cache_movie(movie: Dict[str, Any]) -> tuple[bool, bool]:
                 continue
 
     logger.info(f"Updated episodes for: {slug}")
-    return True, False
+    return True
 
 def crawl_movies():
     logger.info(f"Start crawl at {datetime.utcnow().isoformat()}Z")
@@ -201,15 +201,9 @@ def crawl_movies():
             continue
 
         for item in items:
-            success, should_stop = cache_movie(item)
-            if should_stop:
-                logger.info(f"Stopping crawl due to unchanged movie: {item.get('slug', 'unknown')}")
-                return
-            if not success:
-                logger.warning(f"Failed to cache movie: {item.get('slug', 'unknown')}")
+            cache_movie(item)
 
         logger.info(f"Processed page {page}")
-        time.sleep(1.0)
 
     logger.info(f"Crawl done at {datetime.utcnow().isoformat()}Z")
 
