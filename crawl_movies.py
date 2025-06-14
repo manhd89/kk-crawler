@@ -48,6 +48,30 @@ except Exception as e:
     logger.error(f"Redis connection failed: {e}")
     exit(1)
 
+# Local cache to store pre-cached data
+local_cache = {}
+
+def load_precache_to_local():
+    """Tải tất cả dữ liệu pre-cached từ Redis vào local_cache một lần."""
+    try:
+        # Lấy tất cả các khóa trong PRECACHE_KEY_SET
+        cache_keys = redis_client.smembers(PRECACHE_KEY_SET)
+        if not cache_keys:
+            logger.info("No pre-cached keys found in Redis")
+            return
+
+        # Tải dữ liệu cho từng khóa
+        for key in cache_keys:
+            try:
+                data = redis_client.get(key)
+                if data:
+                    local_cache[key] = data
+            except Exception as e:
+                logger.error(f"Failed to load key {key}: {e}")
+        logger.info(f"Loaded {len(local_cache)} pre-cached items into local memory")
+    except Exception as e:
+        logger.error(f"Failed to load pre-cache: {e}")
+
 def validate_movie_data(movie: Dict[str, Any]) -> bool:
     return bool(
         movie.get("_id") and movie.get("name") and movie.get("slug") and movie.get("content") and
@@ -115,20 +139,25 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
     }
     full_data_json = json.dumps(full_data, ensure_ascii=False)
 
+    # So sánh với dữ liệu trong local_cache thay vì truy vấn Redis
+    existing_data = local_cache.get(cache_key, "{}")
+    if existing_data and existing_data != "{}":
+        if compare_json(full_data_json, existing_data):
+            logger.info(f"Skipped unchanged: {slug}")
+            return True
+
+    # Cập nhật Redis và local_cache nếu dữ liệu mới
     try:
-        existing_data = redis_client.get(cache_key) or "{}"
-        if existing_data and existing_data != "{}":
-            if compare_json(full_data_json, existing_data):
-                logger.info(f"Skipped unchanged: {slug}")
-                return True
         redis_client.set(cache_key, full_data_json)
         redis_client.sadd(PRECACHE_KEY_SET, cache_key)
+        local_cache[cache_key] = full_data_json  # Cập nhật local_cache
         logger.info(f"Cached movie: {slug}")
     except Exception:
         return False
 
     try:
         redis_client.set(id_to_slug_key, slug)
+        local_cache[id_to_slug_key] = slug  # Cập nhật local_cache
     except Exception:
         return False
 
@@ -147,13 +176,17 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
             }
             stream_data_json = json.dumps(stream_data, ensure_ascii=False)
 
+            # So sánh với dữ liệu trong local_cache
+            existing_stream = local_cache.get(stream_key, "{}")
+            if existing_stream and existing_stream != "{}":
+                if compare_json(stream_data_json, existing_stream):
+                    continue
+
+            # Cập nhật Redis và local_cache
             try:
-                existing_stream = redis_client.get(stream_key) or "{}"
-                if existing_stream and existing_stream != "{}":
-                    if compare_json(stream_data_json, existing_stream):
-                        continue
                 redis_client.set(stream_key, stream_data_json)
                 redis_client.sadd(PRECACHE_KEY_SET, stream_key)
+                local_cache[stream_key] = stream_data_json  # Cập nhật local_cache
             except Exception:
                 continue
 
@@ -163,6 +196,9 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
 def crawl_movies():
     page = 1
     logger.info(f"Start crawl at {datetime.utcnow().isoformat()}Z")
+
+    # Tải pre-cache một lần trước khi bắt đầu crawl
+    load_precache_to_local()
 
     while True:
         try:
@@ -188,7 +224,6 @@ def crawl_movies():
             break
 
         page += 1
-        time.sleep(1.0)
 
     logger.info(f"Crawl done at {datetime.utcnow().isoformat()}Z")
 
