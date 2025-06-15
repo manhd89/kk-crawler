@@ -11,7 +11,7 @@ from typing import Dict, Any
 import unicodedata
 from upstash_redis import Redis
 
-# Only show INFO logs
+# Logging config
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -71,11 +71,11 @@ def sanitize_string(s: Any) -> str:
     s = s.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
     return "".join(c for c in s if c.isprintable())
 
-def cache_movie(movie: Dict[str, Any]) -> bool:
+def cache_movie(movie: Dict[str, Any]) -> str:
     slug = movie.get("slug", "")
     movie_id = movie.get("_id", "")
     if not slug or not movie_id:
-        return False
+        return "failed"
 
     cache_key = f"movieapp:movie_{slug}"
     id_to_slug_key = f"movieapp:id_to_slug_{movie_id}"
@@ -86,15 +86,15 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
         data = response.json()
         time.sleep(2.0)
     except requests.RequestException:
-        return False
+        return "failed"
 
     if not data.get("status", False):
-        return False
+        return "failed"
 
     movie_data = data.get("movie", {})
     episodes_data = data.get("episodes", [])
     if not validate_movie_data(movie_data):
-        return False
+        return "failed"
 
     for key in ["content", "name", "origin_name", "trailer_url", "filename"]:
         if key in movie_data:
@@ -120,17 +120,17 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
         if existing_data and existing_data != "{}":
             if compare_json(full_data_json, existing_data):
                 logger.info(f"Skipped unchanged: {slug}")
-                return True
+                return "skipped"
         redis_client.set(cache_key, full_data_json)
         redis_client.sadd(PRECACHE_KEY_SET, cache_key)
         logger.info(f"Cached movie: {slug}")
     except Exception:
-        return False
+        return "failed"
 
     try:
         redis_client.set(id_to_slug_key, slug)
     except Exception:
-        return False
+        return "failed"
 
     for server_index, server in enumerate(episodes_data[-MAX_EPISODES:]):
         for episode_index, episode in enumerate(server.get("server_data", [])):
@@ -158,52 +158,45 @@ def cache_movie(movie: Dict[str, Any]) -> bool:
                 continue
 
     logger.info(f"Updated episodes for: {slug}")
-    return True
+    return "cached"
 
 def crawl_movies():
+    page = 1
     logger.info(f"Start crawl at {datetime.utcnow().isoformat()}Z")
 
-    # Fetch the first page to get totalPages
-    try:
-        response = requests.get(f"{API_URL}?page=1&limit={LIMIT}", headers={"User-Agent": USER_AGENT}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException:
-        logger.error("Failed to fetch initial page")
-        return
-
-    if not data.get("status", False):
-        logger.error("Initial page fetch returned invalid status")
-        return
-
-    total_pages = data.get("pagination", {}).get("totalPages", 0)
-    if total_pages == 0:
-        logger.error("No pages available")
-        return
-
-    # Start from the highest page and work backward
-    for page in range(total_pages, 0, -1):
+    while True:
         try:
             response = requests.get(f"{API_URL}?page={page}&limit={LIMIT}", headers={"User-Agent": USER_AGENT}, timeout=10)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException:
-            logger.error(f"Failed to fetch page {page}")
-            continue
+            break
 
         if not data.get("status", False):
-            logger.error(f"Page {page} returned invalid status")
-            continue
+            break
 
         items = data.get("items", [])
+        total_pages = data.get("pagination", {}).get("totalPages", 0)
+
         if not items:
-            logger.info(f"No items found on page {page}")
-            continue
+            break
 
+        skipped_count = 0
         for item in items:
-            cache_movie(item)
+            result = cache_movie(item)
+            if result == "skipped":
+                skipped_count += 1
 
-        logger.info(f"Processed page {page}")
+        # Nếu toàn bộ phim trong trang đều bị skipped => dừng luôn
+        if skipped_count == len(items):
+            logger.info("All movies in this page are unchanged. Stopping script.")
+            return
+
+        if page >= total_pages:
+            break
+
+        page += 1
+        time.sleep(1.0)
 
     logger.info(f"Crawl done at {datetime.utcnow().isoformat()}Z")
 
