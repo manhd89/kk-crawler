@@ -9,6 +9,7 @@ on:
 jobs:
   crawl-movies:
     runs-on: ubuntu-latest
+    permissions: write-all
     steps:
       - name: Checkout repository
         uses: actions/checkout@main
